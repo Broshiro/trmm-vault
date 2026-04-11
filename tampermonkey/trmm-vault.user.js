@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TacticalRMM — Vault
 // @namespace    https://github.com/Broshiro/trmm-vault
-// @version      1.0.0
+// @version      1.1.0
 // @description  Adds a Vault panel to TacticalRMM that shows Vaultwarden credentials for the current client
 // @author       Broshiro
 // @match        https://YOUR-TRMM-DOMAIN/*
@@ -25,8 +25,6 @@
   GM_addStyle(`
     #vault-btn {
       position: fixed;
-      bottom: 24px;
-      right: 24px;
       z-index: 9999;
       background: #1976D2;
       color: #fff;
@@ -35,18 +33,18 @@
       padding: 10px 18px;
       font-size: 14px;
       font-weight: 600;
-      cursor: pointer;
+      cursor: grab;
       box-shadow: 0 2px 8px rgba(0,0,0,0.3);
       display: flex;
       align-items: center;
       gap: 8px;
+      user-select: none;
     }
     #vault-btn:hover { background: #1565C0; }
+    #vault-btn.dragging { cursor: grabbing; opacity: 0.85; }
 
     #vault-panel {
       position: fixed;
-      bottom: 72px;
-      right: 24px;
       z-index: 9998;
       width: 360px;
       max-height: 520px;
@@ -155,9 +153,82 @@
   `;
   document.body.appendChild(panel);
 
-  btn.addEventListener('click', () => {
+  // --- Draggable button + persistent position ---
+  const POS_KEY = 'vault-btn-pos';
+  const DEFAULT_POS = { right: 24, bottom: 24 };
+
+  function applyPos(pos) {
+    btn.style.right  = pos.right  != null ? pos.right  + 'px' : '';
+    btn.style.bottom = pos.bottom != null ? pos.bottom + 'px' : '';
+    btn.style.left   = pos.left   != null ? pos.left   + 'px' : '';
+    btn.style.top    = pos.top    != null ? pos.top    + 'px' : '';
+    positionPanel();
+  }
+
+  function positionPanel() {
+    const r = btn.getBoundingClientRect();
+    const panelH = 520;
+    const margin = 8;
+    // Place panel above the button
+    const spaceAbove = r.top;
+    const spaceBelow = window.innerHeight - r.bottom;
+    if (spaceAbove >= panelH + margin || spaceAbove > spaceBelow) {
+      panel.style.top    = '';
+      panel.style.bottom = (window.innerHeight - r.top + margin) + 'px';
+    } else {
+      panel.style.bottom = '';
+      panel.style.top    = (r.bottom + margin) + 'px';
+    }
+    // Align panel's right edge with button's right edge
+    const rightEdge = window.innerWidth - r.right;
+    panel.style.right = Math.max(4, rightEdge) + 'px';
+    panel.style.left  = '';
+  }
+
+  try {
+    applyPos(JSON.parse(localStorage.getItem(POS_KEY)) || DEFAULT_POS);
+  } catch(e) {
+    applyPos(DEFAULT_POS);
+  }
+
+  let dragging = false, dragMoved = false, ox = 0, oy = 0;
+
+  btn.addEventListener('mousedown', e => {
+    dragging = true;
+    dragMoved = false;
+    ox = e.clientX - btn.getBoundingClientRect().left;
+    oy = e.clientY - btn.getBoundingClientRect().top;
+    btn.classList.add('dragging');
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    dragMoved = true;
+    const x = e.clientX - ox;
+    const y = e.clientY - oy;
+    // Convert to right/bottom so it stays put on resize
+    const right  = window.innerWidth  - x - btn.offsetWidth;
+    const bottom = window.innerHeight - y - btn.offsetHeight;
+    const pos = {
+      right:  Math.max(0, Math.min(right,  window.innerWidth  - btn.offsetWidth)),
+      bottom: Math.max(0, Math.min(bottom, window.innerHeight - btn.offsetHeight)),
+    };
+    applyPos(pos);
+    localStorage.setItem(POS_KEY, JSON.stringify(pos));
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (dragging) {
+      dragging = false;
+      btn.classList.remove('dragging');
+    }
+  });
+
+  btn.addEventListener('click', e => {
+    if (dragMoved) return; // suppress click after drag
     panel.classList.toggle('open');
-    if (panel.classList.contains('open')) loadOrgs();
+    if (panel.classList.contains('open')) { positionPanel(); loadOrgs(); }
   });
 
   document.getElementById('vault-sync-btn').addEventListener('click', () => {
