@@ -1,0 +1,12 @@
+services:
+  vault-proxy:
+    build: .
+    container_name: vault-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8200:8200"
+    environment:
+      - BW_EMAIL=your-vaultwarden-email@example.com
+      - BW_PASSWORD=your-vaultwarden-master-password
+      - BW_SERVER=https://your-vaultwarden-domain
+      - CORS_ORIGINS=https://your-trmm-domain
