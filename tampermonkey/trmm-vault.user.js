@@ -1,26 +1,214 @@
 // ==UserScript==
-// @name         TacticalRMM — Vault
+// @name         TacticalRMM — Vault + Clipboard Sync
 // @namespace    https://github.com/Broshiro/trmm-vault
-// @version      1.1.0
-// @description  Adds a Vault panel to TacticalRMM that shows Vaultwarden credentials for the current client
+// @version      1.2.0
+// @description  Vault panel for TRMM + seamless clipboard sync in MeshCentral remote sessions
+// @updateURL    https://raw.githubusercontent.com/Broshiro/trmm-vault/main/tampermonkey/trmm-vault.user.js
+// @downloadURL  https://raw.githubusercontent.com/Broshiro/trmm-vault/main/tampermonkey/trmm-vault.user.js
 // @author       Broshiro
-// @match        https://YOUR-TRMM-DOMAIN/*
+// @match        https://trmm.ambrose.rocks/*
+// @match        https://mesh.ambrose.rocks/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
-// @connect      YOUR-TRMM-DOMAIN
+// @connect      trmm.ambrose.rocks
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   // ============================================================
-  // CONFIGURATION — update these to match your environment
+  // CLIPBOARD SYNC — runs on mesh.ambrose.rocks remote desktop pages
   // ============================================================
-  // The vault-proxy API endpoint. If you added the /vault-api/ location
-  // block to your TRMM nginx conf, use:  https://your-trmm-domain/vault-api
-  // If you exposed vault-proxy separately, use that URL instead.
-  const API = 'https://YOUR-TRMM-DOMAIN/vault-api';
+  if (window.location.hostname === 'mesh.ambrose.rocks') {
+    initClipboardSync();
+    return;
+  }
+
   // ============================================================
+  // VAULT — runs on trmm.ambrose.rocks
+  // ============================================================
+  const API = 'https://trmm.ambrose.rocks/vault-api';
+
+  // ---- Clipboard Sync module ----
+  function initClipboardSync() {
+    let syncEnabled   = false;
+    let lastRemoteClip = '';
+    let syncInterval   = null;
+
+    GM_addStyle(`
+      #clip-sync-btn {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 99999;
+        background: #1565C0;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 18px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+        transition: background 0.2s;
+        user-select: none;
+      }
+      #clip-sync-btn:hover  { background: #0d47a1; }
+      #clip-sync-btn.active { background: #2e7d32; }
+      #clip-sync-btn.flash  { background: #f57f17; }
+      #clip-sync-toast {
+        position: fixed;
+        bottom: 80px;
+        right: 24px;
+        z-index: 99999;
+        background: rgba(0,0,0,0.75);
+        color: #fff;
+        padding: 6px 14px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-family: sans-serif;
+        opacity: 0;
+        transition: opacity 0.2s;
+        pointer-events: none;
+      }
+      #clip-sync-toast.show { opacity: 1; }
+    `);
+
+    const btn   = document.createElement('button');
+    btn.id      = 'clip-sync-btn';
+    btn.title   = 'Click to toggle auto clipboard sync\nCtrl+Shift+V — push local clipboard to remote\nCtrl+Shift+C — pull remote clipboard to local';
+    btn.textContent = '📋 Clipboard Sync';
+    document.body.appendChild(btn);
+
+    const toast = document.createElement('div');
+    toast.id = 'clip-sync-toast';
+    document.body.appendChild(toast);
+
+    function showToast(msg) {
+      toast.textContent = msg;
+      toast.classList.add('show');
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => toast.classList.remove('show'), 2000);
+    }
+
+    // --- Find MeshCentral clipboard elements ---
+    function openClipboardPanel() {
+      // MeshCentral toolbar clipboard button — try multiple selector strategies
+      const candidates = [
+        ...document.querySelectorAll('[title*="Clipboard" i]'),
+        ...document.querySelectorAll('[aria-label*="Clipboard" i]'),
+        ...Array.from(document.querySelectorAll('button,div,span')).filter(el =>
+          /clipboard/i.test(el.getAttribute('title') || el.getAttribute('aria-label') || '')
+        )
+      ];
+      if (candidates.length) { candidates[0].click(); return true; }
+      return false;
+    }
+
+    function getClipboardPanel() {
+      // Look for visible textarea that likely belongs to clipboard panel
+      const textareas = Array.from(document.querySelectorAll('textarea')).filter(t => {
+        const rect = t.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+      const ta = textareas.find(t =>
+        /clip/i.test(t.id + t.className + (t.getAttribute('placeholder') || ''))
+      ) || textareas[0];
+
+      if (!ta) return null;
+
+      // Find Send/Receive buttons near the textarea
+      const allBtns = Array.from(document.querySelectorAll('button, input[type="button"]'));
+      const sendBtn = allBtns.find(b =>
+        /send|set/i.test(b.textContent + b.value) && !/receiv/i.test(b.textContent + b.value)
+      );
+      const recvBtn = allBtns.find(b =>
+        /receiv|get/i.test(b.textContent + b.value)
+      );
+
+      return { ta, sendBtn, recvBtn };
+    }
+
+    // --- Core clipboard operations ---
+    async function pushToRemote() {
+      let text;
+      try { text = await navigator.clipboard.readText(); }
+      catch(e) { showToast('⚠ Clipboard read blocked — grant permission'); return; }
+      if (!text) return;
+
+      let els = getClipboardPanel();
+      if (!els) {
+        openClipboardPanel();
+        await new Promise(r => setTimeout(r, 400));
+        els = getClipboardPanel();
+      }
+      if (!els || !els.ta) { showToast('⚠ Could not find clipboard panel'); return; }
+
+      els.ta.value = text;
+      els.ta.dispatchEvent(new Event('input', { bubbles: true }));
+      if (els.sendBtn) {
+        els.sendBtn.click();
+        showToast('📤 Sent to remote');
+      }
+    }
+
+    async function pullFromRemote(silent) {
+      let els = getClipboardPanel();
+      if (!els) {
+        openClipboardPanel();
+        await new Promise(r => setTimeout(r, 400));
+        els = getClipboardPanel();
+      }
+      if (!els || !els.ta) {
+        if (!silent) showToast('⚠ Could not find clipboard panel');
+        return;
+      }
+
+      if (els.recvBtn) els.recvBtn.click();
+      await new Promise(r => setTimeout(r, 150));
+
+      const text = els.ta.value;
+      if (!text || text === lastRemoteClip) return;
+      lastRemoteClip = text;
+      try {
+        await navigator.clipboard.writeText(text);
+        if (!silent) showToast('📥 Received from remote');
+        else showToast('📥 Clipboard updated from remote');
+      } catch(e) { /* writeText usually works without gesture */ }
+    }
+
+    // --- Keyboard shortcuts ---
+    document.addEventListener('keydown', async e => {
+      if (e.ctrlKey && e.shiftKey && e.key === 'V') {
+        e.preventDefault();
+        await pushToRemote();
+      }
+      if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+        e.preventDefault();
+        await pullFromRemote(false);
+      }
+    }, true);
+
+    // --- Toggle auto-sync ---
+    btn.addEventListener('click', () => {
+      syncEnabled = !syncEnabled;
+      btn.classList.toggle('active', syncEnabled);
+      btn.textContent = syncEnabled ? '📋 Syncing (on)' : '📋 Clipboard Sync';
+
+      if (syncEnabled) {
+        // open panel once so it stays in DOM, then poll
+        openClipboardPanel();
+        syncInterval = setInterval(() => pullFromRemote(true), 2000);
+        showToast('Auto-sync ON — remote clipboard mirrors to local every 2s');
+      } else {
+        clearInterval(syncInterval);
+        syncInterval = null;
+        showToast('Auto-sync OFF');
+      }
+    });
+  }
+
+  // ---- Everything below is the original Vault panel (unchanged) ----
 
   GM_addStyle(`
     #vault-btn {
@@ -58,7 +246,6 @@
       font-family: sans-serif;
     }
     #vault-panel.open { display: flex; }
-
     #vault-header {
       padding: 12px 16px;
       background: #181825;
@@ -86,56 +273,28 @@
       padding: 0 4px;
     }
     #vault-sync-btn:hover { color: #cdd6f4; }
-
-    #vault-items {
-      overflow-y: auto;
-      padding: 8px;
-      flex: 1;
-    }
-
+    #vault-items { overflow-y: auto; padding: 8px; flex: 1; }
     .vault-card {
       background: #313244;
       border-radius: 8px;
       padding: 12px;
       margin-bottom: 8px;
     }
-    .vault-card-name {
-      color: #cdd6f4;
-      font-size: 13px;
-      font-weight: 600;
-      margin-bottom: 8px;
-    }
+    .vault-card-name { color: #cdd6f4; font-size: 13px; font-weight: 600; margin-bottom: 8px; }
     .vault-card-username {
-      color: #6c7086;
-      font-size: 11px;
-      margin-bottom: 8px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      color: #6c7086; font-size: 11px; margin-bottom: 8px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .vault-actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .vault-copy-btn {
-      background: #45475a;
-      color: #cdd6f4;
-      border: none;
-      border-radius: 4px;
-      padding: 5px 10px;
-      font-size: 11px;
-      cursor: pointer;
-      transition: background 0.15s;
+      background: #45475a; color: #cdd6f4; border: none; border-radius: 4px;
+      padding: 5px 10px; font-size: 11px; cursor: pointer; transition: background 0.15s;
     }
     .vault-copy-btn:hover { background: #585b70; }
     .vault-copy-btn.copied { background: #a6e3a1; color: #1e1e2e; }
-
-    #vault-status {
-      padding: 8px 16px;
-      color: #6c7086;
-      font-size: 12px;
-      text-align: center;
-    }
+    #vault-status { padding: 8px 16px; color: #6c7086; font-size: 12px; text-align: center; }
   `);
 
-  // --- UI scaffold ---
   const btn = document.createElement('button');
   btn.id = 'vault-btn';
   btn.innerHTML = '🔑 Vault';
@@ -153,7 +312,6 @@
   `;
   document.body.appendChild(panel);
 
-  // --- Draggable button + persistent position ---
   const POS_KEY = 'vault-btn-pos';
   const DEFAULT_POS = { right: 24, bottom: 24 };
 
@@ -167,66 +325,43 @@
 
   function positionPanel() {
     const r = btn.getBoundingClientRect();
-    const panelH = 520;
-    const margin = 8;
-    // Place panel above the button
-    const spaceAbove = r.top;
-    const spaceBelow = window.innerHeight - r.bottom;
+    const panelH = 520, margin = 8;
+    const spaceAbove = r.top, spaceBelow = window.innerHeight - r.bottom;
     if (spaceAbove >= panelH + margin || spaceAbove > spaceBelow) {
-      panel.style.top    = '';
-      panel.style.bottom = (window.innerHeight - r.top + margin) + 'px';
+      panel.style.top = ''; panel.style.bottom = (window.innerHeight - r.top + margin) + 'px';
     } else {
-      panel.style.bottom = '';
-      panel.style.top    = (r.bottom + margin) + 'px';
+      panel.style.bottom = ''; panel.style.top = (r.bottom + margin) + 'px';
     }
-    // Align panel's right edge with button's right edge
     const rightEdge = window.innerWidth - r.right;
-    panel.style.right = Math.max(4, rightEdge) + 'px';
-    panel.style.left  = '';
+    panel.style.right = Math.max(4, rightEdge) + 'px'; panel.style.left = '';
   }
 
-  try {
-    applyPos(JSON.parse(localStorage.getItem(POS_KEY)) || DEFAULT_POS);
-  } catch(e) {
-    applyPos(DEFAULT_POS);
-  }
+  try { applyPos(JSON.parse(localStorage.getItem(POS_KEY)) || DEFAULT_POS); }
+  catch(e) { applyPos(DEFAULT_POS); }
 
   let dragging = false, dragMoved = false, ox = 0, oy = 0;
-
   btn.addEventListener('mousedown', e => {
-    dragging = true;
-    dragMoved = false;
+    dragging = true; dragMoved = false;
     ox = e.clientX - btn.getBoundingClientRect().left;
     oy = e.clientY - btn.getBoundingClientRect().top;
-    btn.classList.add('dragging');
-    e.preventDefault();
+    btn.classList.add('dragging'); e.preventDefault();
   });
-
   document.addEventListener('mousemove', e => {
-    if (!dragging) return;
-    dragMoved = true;
-    const x = e.clientX - ox;
-    const y = e.clientY - oy;
-    // Convert to right/bottom so it stays put on resize
+    if (!dragging) return; dragMoved = true;
+    const x = e.clientX - ox, y = e.clientY - oy;
     const right  = window.innerWidth  - x - btn.offsetWidth;
     const bottom = window.innerHeight - y - btn.offsetHeight;
     const pos = {
       right:  Math.max(0, Math.min(right,  window.innerWidth  - btn.offsetWidth)),
       bottom: Math.max(0, Math.min(bottom, window.innerHeight - btn.offsetHeight)),
     };
-    applyPos(pos);
-    localStorage.setItem(POS_KEY, JSON.stringify(pos));
+    applyPos(pos); localStorage.setItem(POS_KEY, JSON.stringify(pos));
   });
-
   document.addEventListener('mouseup', () => {
-    if (dragging) {
-      dragging = false;
-      btn.classList.remove('dragging');
-    }
+    if (dragging) { dragging = false; btn.classList.remove('dragging'); }
   });
-
   btn.addEventListener('click', e => {
-    if (dragMoved) return; // suppress click after drag
+    if (dragMoved) return;
     panel.classList.toggle('open');
     if (panel.classList.contains('open')) { positionPanel(); loadOrgs(); }
   });
@@ -237,48 +372,33 @@
       if (orgId) loadItems(orgId);
     });
   });
-
   document.getElementById('vault-org-select').addEventListener('change', e => {
     if (e.target.value) loadItems(e.target.value);
   });
 
-  // --- API helpers ---
   function apiGet(path, cb) {
     GM_xmlhttpRequest({
-      method: 'GET',
-      url: API + path,
+      method: 'GET', url: API + path,
       onload: r => { try { cb(null, JSON.parse(r.responseText)); } catch(e) { cb(e); } },
       onerror: e => cb(e)
     });
   }
-
   function apiPost(path, cb) {
     GM_xmlhttpRequest({
-      method: 'POST',
-      url: API + path,
+      method: 'POST', url: API + path,
       onload: r => { try { cb(null, JSON.parse(r.responseText)); } catch(e) { cb(e); } },
       onerror: e => cb(e)
     });
   }
 
-  // --- Org detection ---
   function getCurrentClientName() {
-    const selectors = [
-      '.q-breadcrumbs__el',
-      '.text-subtitle1',
-      '.text-h6',
-      '[data-cy="client-name"]'
-    ];
+    const selectors = ['.q-breadcrumbs__el','.text-subtitle1','.text-h6','[data-cy="client-name"]'];
     for (const sel of selectors) {
       const els = document.querySelectorAll(sel);
-      for (const el of els) {
-        const text = el.textContent.trim();
-        if (text && text.length > 1) return text;
-      }
+      for (const el of els) { const text = el.textContent.trim(); if (text && text.length > 1) return text; }
     }
     return null;
   }
-
   function bestOrgMatch(clientName, orgs) {
     if (!clientName) return null;
     const needle = clientName.toLowerCase();
@@ -288,39 +408,27 @@
     return match || null;
   }
 
-  // --- Load orgs ---
   let orgsCache = null;
   function loadOrgs() {
     if (orgsCache) { populateOrgSelect(orgsCache); return; }
     setStatus('Loading orgs…');
     apiGet('/orgs', (err, orgs) => {
       if (err || !Array.isArray(orgs)) { setStatus('Failed to load orgs'); return; }
-      orgsCache = orgs;
-      populateOrgSelect(orgs);
+      orgsCache = orgs; populateOrgSelect(orgs);
     });
   }
-
   function populateOrgSelect(orgs) {
     const sel = document.getElementById('vault-org-select');
     sel.innerHTML = '<option value="">— select org —</option>';
     orgs.forEach(o => {
       const opt = document.createElement('option');
-      opt.value = o.id;
-      opt.textContent = o.name;
-      sel.appendChild(opt);
+      opt.value = o.id; opt.textContent = o.name; sel.appendChild(opt);
     });
-
     const clientName = getCurrentClientName();
     const match = bestOrgMatch(clientName, orgs);
-    if (match) {
-      sel.value = match.id;
-      loadItems(match.id);
-    } else {
-      setStatus(clientName ? `No org match for "${clientName}"` : 'Select an org above');
-    }
+    if (match) { sel.value = match.id; loadItems(match.id); }
+    else { setStatus(clientName ? `No org match for "${clientName}"` : 'Select an org above'); }
   }
-
-  // --- Load items ---
   function loadItems(orgId) {
     setStatus('Loading credentials…');
     apiGet(`/orgs/${orgId}/items`, (err, items) => {
@@ -329,7 +437,6 @@
       renderItems(items);
     });
   }
-
   function renderItems(items) {
     const container = document.getElementById('vault-items');
     container.innerHTML = '';
@@ -347,11 +454,9 @@
       `;
       container.appendChild(card);
     });
-
     container.querySelectorAll('.vault-copy-btn:not(.vault-totp-btn)').forEach(b => {
       b.addEventListener('click', () => copyAndFlash(b, b.dataset.copy));
     });
-
     container.querySelectorAll('.vault-totp-btn').forEach(b => {
       b.addEventListener('click', () => {
         b.textContent = '…';
@@ -362,21 +467,16 @@
       });
     });
   }
-
-  // --- Helpers ---
   function copyAndFlash(btn, text) {
     navigator.clipboard.writeText(text).then(() => {
       const orig = btn.textContent;
-      btn.textContent = '✓ Copied';
-      btn.classList.add('copied');
+      btn.textContent = '✓ Copied'; btn.classList.add('copied');
       setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
     });
   }
-
   function setStatus(msg) {
     document.getElementById('vault-items').innerHTML = `<div id="vault-status">${msg}</div>`;
   }
-
   function esc(str) {
     return String(str || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
